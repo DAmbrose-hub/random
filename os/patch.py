@@ -1,4 +1,3 @@
-Page up
 import subprocess,getpass,os
 import json,sys
 hostname = sys.argv[1]
