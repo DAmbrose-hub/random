@@ -1,48 +1,67 @@
-import requests
-import datetime
 import hashlib
 import hmac
+import json
+import requests
+import datetime
+from urllib.parse import urlparse
 
-def get_s3_objects(bucket_name, endpoint, access_key_id, secret_access_key):
-    service = 's3'
-    region = 'us-east-1'
+def sign_request_v4(method, url, headers, data, service, secret_key, access_key):
+    parsed_url = urlparse(url)
+    headers_to_sign = {'host': parsed_url.netloc, 'x-amz-date': headers['X-Amz-Date']}
+    canonical_headers = '\n'.join([f"{key}:{headers_to_sign[key]}" for key in sorted(headers_to_sign)])
+    signed_headers = ';'.join(sorted(headers_to_sign.keys()))
+
+    # Create canonical request
+    canonical_request = '\n'.join([
+        method,
+        parsed_url.path,
+        parsed_url.query,
+        canonical_headers + '\n',
+        signed_headers,
+        hashlib.sha256(data.encode()).hexdigest()
+    ])
+
+    # Create string to sign
+    date_stamp = headers['X-Amz-Date'][0:8]
+    credential_scope = f"{date_stamp}/{service}/s3/aws4_request"
+    string_to_sign = '\n'.join([
+        'AWS4-HMAC-SHA256',
+        headers['X-Amz-Date'],
+        credential_scope,
+        hashlib.sha256(canonical_request.encode()).hexdigest()
+    ])
+
+    # Calculate signature
+    signing_key = get_signature_key(secret_key, date_stamp, service, 'aws4_request')
+    signature = hmac.new(signing_key, (string_to_sign).encode(), hashlib.sha256).hexdigest()
+
+    # Add authorization header
+    authorization_header = f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    headers['Authorization'] = authorization_header
+
+    return headers
+
+def get_signature_key(key, date_stamp, service_name, region_name):
+    k_date = hmac.new(('AWS4' + key).encode('utf-8'), date_stamp.encode('utf-8'), hashlib.sha256).digest()
+    k_region = hmac.new(k_date, service_name.encode('utf-8'), hashlib.sha256).digest()
+    k_service = hmac.new(k_region, region_name.encode('utf-8'), hashlib.sha256).digest()
+    k_signing = hmac.new(k_service, b'aws4_request', hashlib.sha256).digest()
+    return k_signing
+
+def list_objects(bucket_name, endpoint, access_key, secret_key):
     method = 'GET'
-    path = '/'
-
-    # Get the current timestamp in ISO 8601 format
-    timestamp = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-
-    # Generate the AWS Signature Version 4 authentication headers
-    canonical_uri = f'/{bucket_name}'
-    canonical_querystring = ''
-    canonical_headers = f'host:{endpoint}\nx-amz-date:{timestamp}\n'
-    signed_headers = 'host;x-amz-date'
-    payload_hash = hashlib.sha256('').hexdigest()
-    canonical_request = f'{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}'
-    credential_scope = f'{timestamp[:8]}/{region}/{service}/aws4_request'
-    string_to_sign = f'AWS4-HMAC-SHA256\n{timestamp}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}'
-    signing_key = hmac.new(('AWS4' + secret_access_key).encode(), timestamp[:8].encode(), hashlib.sha256).digest()
-    signing_key = hmac.new(signing_key, region.encode(), hashlib.sha256).digest()
-    signing_key = hmac.new(signing_key, service.encode(), hashlib.sha256).digest()
-    signing_key = hmac.new(signing_key, b'aws4_request', hashlib.sha256).digest()
-    signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
-    authorization_header = f'AWS4-HMAC-SHA256 Credential={access_key_id}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}'
-
-    # Send the request to S3
-    url = f'https://{endpoint}/{bucket_name}'
+    now = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    url = f"{endpoint}/{bucket_name}"
     headers = {
-        'Host': endpoint,
-        'X-Amz-Date': timestamp,
-        'Authorization': authorization_header
+        'X-Amz-Date': now
     }
+    signed_headers = sign_request_v4(method, url, headers, '', 's3', secret_key, access_key)
+    headers.update(signed_headers)
     response = requests.get(url, headers=headers)
+    return json.loads(response.text)
 
-    # Parse the response and return the list of objects
-    if response.status_code == 200:
-        objects = []
-        for content in response.content.decode().split('\n'):
-            if content != '':
-                objects.append(content.split('Key>')[-1].split('</')[0])
-        return objects
-    else:
-        print(f'Error getting S3 objects: {response.text}')
+bucket_name = 'my-bucket'
+endpoint = 'https://s3.amazonaws.com'
+access_key = 'MY_ACCESS_KEY'
+secret_key = 'MY_SECRET_KEY'
+
