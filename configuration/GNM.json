@@ -1,0 +1,7 @@
+{
+ "servers" : {
+  "gnmdev":{
+   "libertyinstances" : "somename" 
+  }
+ }
+}
