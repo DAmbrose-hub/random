@@ -1,67 +1,115 @@
-import hashlib
-import hmac
-import json
-import requests
-import datetime
-from urllib.parse import urlparse
+import concurrent.futures
+import os
+import pandas as pd
+import time
+import logging
+import colorlog
 
-def sign_request_v4(method, url, headers, data, service, secret_key, access_key):
-    parsed_url = urlparse(url)
-    headers_to_sign = {'host': parsed_url.netloc, 'x-amz-date': headers['X-Amz-Date']}
-    canonical_headers = '\n'.join([f"{key}:{headers_to_sign[key]}" for key in sorted(headers_to_sign)])
-    signed_headers = ';'.join(sorted(headers_to_sign.keys()))
+# Sample functions to simulate API calls
+def challenge(host):
+    # Simulate API call and return jobid
+    jobid = f"job_{host}"
+    return jobid
 
-    # Create canonical request
-    canonical_request = '\n'.join([
-        method,
-        parsed_url.path,
-        parsed_url.query,
-        canonical_headers + '\n',
-        signed_headers,
-        hashlib.sha256(data.encode()).hexdigest()
-    ])
+def check_status(jobid):
+    # Simulate API call to check status and return status
+    status = f"status_{jobid}"
+    return status
 
-    # Create string to sign
-    date_stamp = headers['X-Amz-Date'][0:8]
-    credential_scope = f"{date_stamp}/{service}/s3/aws4_request"
-    string_to_sign = '\n'.join([
-        'AWS4-HMAC-SHA256',
-        headers['X-Amz-Date'],
-        credential_scope,
-        hashlib.sha256(canonical_request.encode()).hexdigest()
-    ])
+def process_host(host):
+    jobid = challenge(host)
+    return host, jobid
 
-    # Calculate signature
-    signing_key = get_signature_key(secret_key, date_stamp, service, 'aws4_request')
-    signature = hmac.new(signing_key, (string_to_sign).encode(), hashlib.sha256).hexdigest()
+def get_status_info(host, jobid, check_status_func, logger):
+    max_retries = 5
+    retries = 0
 
-    # Add authorization header
-    authorization_header = f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
-    headers['Authorization'] = authorization_header
+    while retries < max_retries:
+        status = check_status_func(jobid)
+        logger.info(f"Checking status for Host: {host}, JobID: {jobid}, Status: {status}")
 
-    return headers
+        if status == "completed":
+            logger.info(f"Status check complete for Host: {host}, JobID: {jobid}, Status: {status}")
+            return host, jobid, status
 
-def get_signature_key(key, date_stamp, service_name, region_name):
-    k_date = hmac.new(('AWS4' + key).encode('utf-8'), date_stamp.encode('utf-8'), hashlib.sha256).digest()
-    k_region = hmac.new(k_date, service_name.encode('utf-8'), hashlib.sha256).digest()
-    k_service = hmac.new(k_region, region_name.encode('utf-8'), hashlib.sha256).digest()
-    k_signing = hmac.new(k_service, b'aws4_request', hashlib.sha256).digest()
-    return k_signing
+        retries += 1
+        time.sleep(1)  # Adjust the sleep time as needed
 
-def list_objects(bucket_name, endpoint, access_key, secret_key):
-    method = 'GET'
-    now = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-    url = f"{endpoint}/{bucket_name}"
-    headers = {
-        'X-Amz-Date': now
-    }
-    signed_headers = sign_request_v4(method, url, headers, '', 's3', secret_key, access_key)
-    headers.update(signed_headers)
-    response = requests.get(url, headers=headers)
-    return json.loads(response.text)
+    logger.warning(f"Status check timeout for Host: {host}, JobID: {jobid}, Status: {status}")
+    return host, jobid, status
 
-bucket_name = 'my-bucket'
-endpoint = 'https://s3.amazonaws.com'
-access_key = 'MY_ACCESS_KEY'
-secret_key = 'MY_SECRET_KEY'
 
+def main():
+    # Sample list of hostnames
+    hostnames = ['h1', 'h2', 'h3', 'h4', 'h5']
+
+    # Determine the number of CPU cores available
+    num_cores = os.cpu_count()
+
+    # Calculate the maximum number of concurrent threads (slightly less than the number of cores)
+    max_threads = max(num_cores - 1, 1)
+
+    # Create a logger for host-level messages
+    host_logger = colorlog.getLogger(f"HostLogger")
+    host_logger.setLevel(logging.INFO)
+    handler = colorlog.StreamHandler()
+    formatter = colorlog.ColoredFormatter(
+        "%(log_color)s[%(levelname)s] %(asctime)s %(message)s%(reset)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        log_colors={
+            'DEBUG': 'cyan',
+            'INFO': 'green',
+            'WARNING': 'yellow',
+            'ERROR': 'red',
+            'CRITICAL': 'red,bg_white',
+        }
+    )
+    handler.setFormatter(formatter)
+    host_logger.addHandler(handler)
+
+    with concurrent.futures.ThreadPoolExecutor(max_threads) as executor:
+        # Submit tasks to the executor to get jobids for all hosts
+        future_to_host = {
+            executor.submit(process_host, host): host for host in hostnames
+        }
+
+        # Initialize an empty list to store the job info
+        job_info = []
+
+        # Wait for all tasks to complete and get jobids
+        for future in concurrent.futures.as_completed(future_to_host):
+            host = future_to_host[future]
+            try:
+                host, jobid = future.result()
+                # Append the job info as a tuple to the list
+                job_info.append((host, jobid))
+            except Exception as exc:
+                host_logger.error(f"Host: {host}, Error occurred: {exc}")
+
+        host_logger.info("Job IDs obtained for all hosts.")
+
+        # Submit tasks to the executor to get status info for all hosts
+        future_to_status = {
+            executor.submit(get_status_info, host, jobid, check_status, host_logger): (host, jobid) for host, jobid in job_info
+        }
+
+        # Wait for all status info tasks to complete
+        for future in concurrent.futures.as_completed(future_to_status):
+            host, jobid = future_to_status[future]
+            try:
+                host, jobid, status = future.result()
+                # Update the job_info list with status
+                job_info[job_info.index((host, jobid))] = (host, jobid, status)
+            except Exception as exc:
+                host_logger.error(f"Host: {host}, Error occurred: {exc}")
+
+    # Create a pandas DataFrame from the job_info list
+    df = pd.DataFrame(job_info, columns=['Host', 'JobID', 'Status'])
+
+    # Export the DataFrame to Excel
+    excel_filename = 'job_info.xlsx'
+    df.to_excel(excel_filename, index=False)
+
+    host_logger.info(f"Job information exported to {excel_filename} successfully.")
+
+main()
